@@ -10,6 +10,16 @@ size_t global_min_chunk_size = 0;
 int global_object_per_slab = 0;
 enum malloc_type global_mode_type = MALLOC_BUDDY;
 
+
+typedef struct free_node {
+    struct free_node* next;
+    size_t offset;
+} free_node_t;
+
+#define MAX_ORDERS 32
+static free_node_t* global_free_lists[MAX_ORDERS];
+static int global_max_order;
+
 static inline size_t order_to_size(int order){
     return (size_t)global_min_chunk_size << order;
 } // returns the block size from the given order number
@@ -44,7 +54,7 @@ static inline size_t pointer_to_offset(void* p){
 } // convert the pointer to byte offset so we know which byte block starts
 
 static inline void* offset_to_pointer(size_t off){
-    (void*)((char*)global_base + off);
+    return (void*)((char*)global_base + off);
 } // convert back to pointer from give byte offset
 
 static inline size_t buddy_of(size_t off, size_t block_size){
@@ -54,17 +64,17 @@ static inline size_t buddy_of(size_t off, size_t block_size){
 // this for free list operation
 static void freelist_insert_sort(int order, size_t block_off){
     free_node_t* node = (free_node_t*)malloc(sizeof(free_node_t));
-    n -> offset = block_off;
+    node -> offset = block_off;
     free_node_t** head = &global_free_lists[order];
     if (*head == NULL || (*head)->offset > block_off){
-        n->next = *head;
-        *head = n;
+        node->next = *head;
+        *head = node;
         return;
     }
     free_node_t* current = *head;
     while (current->next && current->next->offset < block_off) current = current->next;
-    n->next = cur->next;
-    cur->next = n;
+    node->next = current->next;
+    current->next = node;
 } // create node and insert into the free list and sort them
 
 static bool freelist_remove(int order, size_t block_off){
@@ -101,7 +111,7 @@ static bool split(int want_order, int* from_order, size_t* out_off){
     // we pop the buddy of the lowest address until we reach the order that we want
     int order;
     size_t off;
-    for (order = want_order; order <= global_max_order; ++o) {
+    for (order = want_order; order <= global_max_order; ++order) {
         if (freelist_pop_lowest(order, &off)) {
             break;
         }
@@ -125,7 +135,7 @@ static size_t merge(size_t off, int* io_order){
     while (1) {
         size_t size = order_to_size(order);
         size_t b_off = buddy_of(off, size);
-        if (!freelist_remove(o, b_off)) break;
+        if (!freelist_remove(order, b_off)) break;
         off = (b_off < off) ? b_off : off;
         order += 1;
         if (order > global_max_order) break;
@@ -142,19 +152,12 @@ static inline header_t* header_block(void* block_start){
     return (header_t*)block_start;
 } // give the header location at the start of the block when doing malloc
 
-typedef struct free_node {
-    struct free_node* next;
-    size_t offset;
-} free_node_t;
 
-#define MAX_ORDERS 32
-static free_node_t* global_free_lists[MAX_ORDERS];
-static int global_max_order;
 
 // internal tag
 #define TAG_BUDY 0x42554459u
 
-void buddy_malloc(int user_size){
+void *buddy_malloc(int user_size){
     // user size + global header 8
     // max of result and min chunk 512
     // call next power 2 to know which block size to use
