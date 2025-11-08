@@ -30,3 +30,6 @@ typedef struct {
     uint32_t tag;
     uint32_t order;
 } header_t;
+
+void buddy_init(void);
+void buddy_cleanup(void);
