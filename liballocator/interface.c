@@ -15,6 +15,9 @@ void *my_malloc(int size) {
 }
 
 void my_free(void *ptr) {
-    buddy_free(ptr);
+    if (!ptr) return;
+    if (global_mode_type == MALLOC_BUDDY){
+        buddy_free(ptr);
+    }
     return;
 }
