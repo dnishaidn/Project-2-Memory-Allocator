@@ -199,21 +199,27 @@ void buddy_free(void* user_ptr){
 }
 
 void buddy_init(void) {
-    for (int i = 0; i < MAX_ORDERS; ++i) global_free_lists[i] = NULL;
-    size_t blocks = global_memory_size / global_min_chunk_size;
-    int maxo = 0;
-    while ((size_t)(1ull << maxo) < blocks && maxo + 1 < MAX_ORDERS) maxo++;
-    global_max_order = maxo;
+    // clear each order free list
+    // find the max num of blocks that can fit inside memory
+    // find largest power of two blocks, and set it equal gmo
+    // call free list
+    for (int i = 0; i < MAX_ORDERS; ++i) global_free_lists[i] = NULL; 
+    size_t blocks = global_memory_size / global_min_chunk_size; 
+    int maxorder = 0;
+    while ((size_t)(1ull << maxorder) < blocks && maxorder + 1 < MAX_ORDERS) maxorder++;
+    global_max_order = maxorder;
     freelist_insert_sort(global_max_order, 0);
 }
 
 void buddy_cleanup(void) {
+    // for each order list, we will start at the head of each list, save the next pointer, then free the current node
+    // we jump to the next node, and clear the head
     for (int i = 0; i < MAX_ORDERS; ++i) {
-        free_node_t* cur = global_free_lists[i];
-        while (cur) {
-            free_node_t* nxt = cur->next;
-            free(cur);
-            cur = nxt;
+        free_node_t* current = global_free_lists[i];
+        while (current) {
+            free_node_t* nxt = current->next;
+            free(current);
+            current = nxt;
         }
         global_free_lists[i] = NULL;
     }
