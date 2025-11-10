@@ -8,6 +8,8 @@ size_t global_memory_size = 0;
 size_t global_header_size = 0;
 size_t global_min_chunk_size = 0;
 int global_object_per_slab = 0;
+
+
 enum malloc_type global_mode_type = MALLOC_BUDDY;
 
 
@@ -225,22 +227,121 @@ void buddy_cleanup(void) {
     }
 }
 
+
 // ======================= Slab Allocation =======================
 
-void* slab_malloc(int user_size){
+typedef struct sdt_row {
+    size_t type_bytes;        
+    size_t slab_size_bytes;   
+    int    total_objects;     
+    int    used_objects;      
+    void*  slab_ptr;          
+    struct sdt_row* next;
+} sdt_row_t;
 
+typedef struct slab {
+    struct slab* next;        // slabs for this class
+    void*  slab_start;        // buddy base 
+    size_t slab_size;         // actual buddy block size (power-of-two)
+    size_t actual_obj_size;          
+    size_t capacity;          // # objects
+    size_t used;              // # in use
+    sdt_row_t* sdt;           // SDT 
+} slab_t;
+ 
+typedef struct slab_class {               //class represents a a specific slab and its type size,
+    size_t actual_obj_size;               // eg. class[1] = store type_size 600bytes
+    free_node_t* free_objs;               // eg. class[2] = store type_size 1000bytes
+    slab_t* slabs;            
+} slab_class_t;
+
+#define MAX_CLASSES 128
+static slab_class_t g_classes[MAX_CLASSES];
+static int global_type_count = 0;
+
+static void class_insert_sorted(free_node_t** head, size_t off) {
+    free_node_t* node = (free_node_t*)malloc(sizeof(free_node_t));
+    node->offset = off;
+    if (*head == NULL || (*head)->offset > off) {
+        node->next = *head; *head = node; return;
+    }
+    free_node_t* cur = *head;
+    while (cur->next && cur->next->offset < off) cur = cur->next;
+    node->next = cur->next; cur->next = node;
+}
+static bool class_pop_lowest(free_node_t** head, size_t* out_off) {
+    if (*head == NULL) return false;
+    free_node_t* n = *head; *out_off = n->offset; *head = n->next; free(n); return true;
+}
+static bool class_remove(free_node_t** head, size_t off) {
+    free_node_t* cur = *head; free_node_t* prev = NULL;
+    while (cur) {
+        if (cur->offset == off) {
+            if (prev) prev->next = cur->next; else *head = cur->next;
+            free(cur); return true;
+        }
+        prev = cur; cur = cur->next;
+    }
+    return false;
 }
 
-void slab_free(void* user_ptr){
 
+static int find_class(size_t actual_obj_size) {
+    for (int i = 0; i < global_type_count; ++i) {
+        if (g_classes[i].actual_obj_size == actual_obj_size) return i;         // returning the class
+    }
+    g_classes[global_type_count] = (slab_class_t){          // create a new class if the slab for that type does not exist yet
+        .actual_obj_size = actual_obj_size,                                   
+        .free_objs = NULL,
+        .slabs = NULL
+    };
+
+    return global_type_count++;
 }
 
-void  slab_init(void){
+static slab_t* slab_new(size_t type_bytes){
+    size_t actual_obj_size   = global_header_size + type_bytes;               
+    size_t size_of_slab  = (size_t)global_object_per_slab * actual_obj_size;
 
-}
+    void* slab_from_buddy = buddy_malloc(size_of_slab);  // ask buddy for slab
+    if (!slab_from_buddy) return NULL;
 
-void  slab_cleanup(void){
+
+    void* slab_start = (uint8_t*)slab_from_buddy - global_header_size;     // buddy header is here
+
+    header_t* bh = (header_t*)slab_start;
+    size_t real_slab_size = ((size_t)global_min_chunk_size) << bh->order;
+
+
+    size_t cap = (size_t)global_object_per_slab;                      // create the slab
+    slab_t* s = (slab_t*)malloc(sizeof(*s));
+    *s = (slab_t){ .next=NULL, .slab_start=slab_start, .slab_size=real_slab_size,
+                   .actual_obj_size=actual_obj_size, .capacity=cap, .used=0, .sdt=NULL };
+
+    // create class for that type_size 
+    int class_id = find_class(actual_obj_size);
+  
+    s->next = g_classes[class_id].slabs;
+    g_classes[class_id].slabs = s;
+
     
+    uint8_t* base = (uint8_t*)slab_start + global_header_size;
+    for (size_t i = 0; i < cap; ++i){
+        size_t off = pointer_to_offset(base + i * actual_obj_size);
+        class_insert_sorted(&g_classes[class_id].free_objs, off);
+    }
+
+    //update SDT
+    s->sdt = (sdt_row_t*)malloc(sizeof(sdt_row_t));
+    *(s->sdt) = (sdt_row_t){ .type_bytes=type_bytes, .slab_size_bytes=real_slab_size,
+                             .total_objects=(int)cap, .used_objects=0,
+                             .slab_ptr=slab_start, .next=NULL };
+    return s;
 }
+
+
+
+
+
 
 

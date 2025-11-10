@@ -23,5 +23,5 @@ void my_free(void *ptr) {
         return slab_free(ptr);
     }
 
-    return NULL;
+   
 }
