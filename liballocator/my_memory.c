@@ -242,8 +242,8 @@ typedef struct sdt_row {
 typedef struct slab {
     struct slab* next;        // slabs for this class
     void*  slab_start;        // buddy base 
-    size_t slab_size;         // actual buddy block size (power-of-two)
-    size_t actual_obj_size;          
+    size_t slab_size;         // actual buddy block size (power-of-two)   
+    size_t actual_obj_size;
     size_t capacity;          // # objects
     size_t used;              // # in use
     sdt_row_t* sdt;           // SDT 
@@ -255,8 +255,8 @@ typedef struct slab_class {               //class represents a a specific slab a
     slab_t* slabs;            
 } slab_class_t;
 
-#define MAX_CLASSES 128
-static slab_class_t g_classes[MAX_CLASSES];
+#define MAX_CLASSES 50000
+static slab_class_t global_classes[MAX_CLASSES];
 static int global_type_count = 0;
 
 static void class_insert_sorted(free_node_t** head, size_t off) {
@@ -288,9 +288,9 @@ static bool class_remove(free_node_t** head, size_t off) {
 
 static int find_class(size_t actual_obj_size) {
     for (int i = 0; i < global_type_count; ++i) {
-        if (g_classes[i].actual_obj_size == actual_obj_size) return i;         // returning the class
+        if (global_classes[i].actual_obj_size == actual_obj_size) return i;         // returning the class
     }
-    g_classes[global_type_count] = (slab_class_t){          // create a new class if the slab for that type does not exist yet
+    global_classes[global_type_count] = (slab_class_t){          // create a new class if the slab for that type does not exist yet
         .actual_obj_size = actual_obj_size,                                   
         .free_objs = NULL,
         .slabs = NULL
@@ -321,14 +321,14 @@ static slab_t* slab_new(size_t type_bytes){
     // create class for that type_size 
     int class_id = find_class(actual_obj_size);
   
-    s->next = g_classes[class_id].slabs;
-    g_classes[class_id].slabs = s;
+    s->next = global_classes[class_id].slabs;
+    global_classes[class_id].slabs = s;
 
     
     uint8_t* base = (uint8_t*)slab_start + global_header_size;
     for (size_t i = 0; i < cap; ++i){
         size_t off = pointer_to_offset(base + i * actual_obj_size);
-        class_insert_sorted(&g_classes[class_id].free_objs, off);
+        class_insert_sorted(&global_classes[class_id].free_objs, off);
     }
 
     //update SDT
@@ -338,6 +338,59 @@ static slab_t* slab_new(size_t type_bytes){
                              .slab_ptr=slab_start, .next=NULL };
     return s;
 }
+
+void slab_init(void){
+    global_type_count = 0;
+    for (int i = 0; i < MAX_CLASSES; ++i)
+     global_classes[i] = (slab_class_t){0};
+}
+
+
+
+void* slab_malloc(int user_size){
+    if (user_size <= 0) return NULL;
+    size_t actual_obj_size = global_header_size + (size_t)user_size;        
+    int class_id = find_class(actual_obj_size);
+    if (class_id < 0) return NULL;
+
+    size_t obj_off = 0;
+    if (!class_pop_lowest(&global_classes[class_id].free_objs, &obj_off)) {
+
+        slab_t* made = slab_new((size_t)user_size);     //makes new slab if there is no slab
+        if (!made) return NULL;
+
+       
+        if (!class_pop_lowest(&global_classes[class_id].free_objs, &obj_off)) return NULL;
+    }
+
+    void* obj_block = offset_to_pointer(obj_off);
+
+    header_t* oh = (header_t*)obj_block;
+    oh->tag = TAG_BUDY;
+    oh->order = 0;
+
+    slab_t* s = global_classes[class_id].slabs;
+    while (s != NULL) {
+        uint8_t* slab_begin = (uint8_t*)s->slab_start + global_header_size;
+        uint8_t* slab_end   = slab_begin + (s->capacity * s->actual_obj_size);
+
+        if ((uint8_t*)obj_block >= slab_begin && (uint8_t*)obj_block < slab_end) {
+            s->used++;
+
+            if (s->sdt != NULL)
+                s->sdt->used_objects++;
+            break;
+    }
+
+    s = s->next;
+}
+
+    return (uint8_t*)obj_block + global_header_size;                  // user pointer
+}
+
+
+
+
 
 
 
