@@ -246,8 +246,23 @@ typedef struct {
     size_t *free_offs;      // array holding the offsets
 } simple_slab_t;
 
+
+typedef struct sdt {
+    size_t type_bytes;        // user object size 
+    size_t slab_size_bytes;   // size of the full slab allocated from buddy
+    int total_objects;        //# of total objs that can fit
+    int used_objects;         // how many of objs occupying the slab
+    void* slab_ptr;           // pointer to start of the slab
+    struct sdt* next;
+} sdt;
+
+static sdt* sdt_head = NULL;
+
+
 static simple_slab_t slabs[MAX_SLABS];
 static int slab_count = 0;
+
+
 
 static int make_slab(size_t real_objects_size) {
     int slab_id = -1;
@@ -266,7 +281,7 @@ static int make_slab(size_t real_objects_size) {
     int cap = global_object_per_slab;
     size_t bytes_slab_use = (size_t)cap * real_objects_size;
 
-    void* slab_from_buddy = buddy_malloc(bytes_slab_use);            //use buddy allocator to give slab large enough for the memory
+    void* slab_from_buddy = buddy_malloc(bytes_slab_use);    //#### use buddy allocator to give slab large enough for the memory
     if (!slab_from_buddy)
         return -1;
 
@@ -302,12 +317,139 @@ void slab_init(void) {
         slabs[i].slab_off = 0;
         slabs[i].real_objects_size = 0;
         slabs[i].capacity = 0;
+
         slabs[i].used = 0;
         slabs[i].free_top = 0;
         slabs[i].free_offs = NULL;
     }
     slab_count = 0;
 }
+
+void* slab_malloc(int user_size) {
+    if (user_size <= 0) return NULL;
+
+    size_t real_objects_size = (size_t)user_size + (size_t)global_header_size;   //add header for the user size
+
+    int slab_id = -1;     
+    for (int i = 0; i < slab_count; i++) {
+    simple_slab_t *s = &slabs[i];  //basically just checking if the objects size that the slab houses, matches our needed size                                                      
+
+    if (!s->alive)
+        continue;   
+    if (s->real_objects_size != real_objects_size)
+        continue;   
+    if (s->free_top == 0)
+        continue;   
+    slab_id = i;    // found a good match
+    break;
+    }
+
+    if (slab_id < 0) {                                    // if there is no suitable slab for that size, create new one!!
+        slab_id = make_slab(real_objects_size); 
+        if (slab_id < 0) return NULL;
+    }
+
+    simple_slab_t *S = &slabs[slab_id];                    //pointer S point to slab to allocate
+    size_t obj_off = S->free_offs [--S->free_top];                        // take the last free offset and decrsea free top 
+    S->used++;
+
+    uint8_t* object_hdr = (uint8_t*)offset_to_pointer(obj_off);
+
+    header_t* h = (header_t*)object_hdr;                 //write thos object_hdr at the start of mem block
+    h->order = (uint32_t)slab_id;
+
+    return object_hdr + global_header_size;               //return pointerr
+}
+
+void slab_free(void* user_ptr) {
+    if (user_ptr == NULL) {
+        return;
+    }
+
+    uint8_t *object_hdr = (uint8_t*)user_ptr - global_header_size;
+
+    header_t *h = (header_t*)object_hdr;
+
+    int sid = (int)h->order;
+    if (sid < 0) {
+        return;
+    }
+    if (sid >= slab_count) {
+        return;
+    }
+
+    simple_slab_t *s = &slabs[sid];   //getting pointer for that slab
+    if (!s->alive) {
+        return;
+    }
+
+    uint8_t *slab_ptr = (uint8_t*)offset_to_pointer(s->slab_off);          //convert offset back to ptr
+    uint8_t *where_start = slab_ptr + global_header_size;
+
+    size_t difference = (size_t)(object_hdr - where_start);    // compute how far obj hdr is from  the first obj hdr
+    if ((difference % s->real_objects_size) != 0) {
+        return;
+    }
+
+    if (s->free_top < s->capacity) {                        //pushing obj back into the free stack
+        size_t off = pointer_to_offset(object_hdr);         // store offset and bump the stack top
+        s->free_offs[s->free_top] = off;
+        s->free_top += 1;
+    }
+
+    if (s->used > 0) {
+        s->used -= 1;
+    }
+
+    if (s->used == 0) {                                      //return the empty slab memory back to buddy allocator
+        int all_free = (s->free_top == s->capacity);
+        if (all_free) {
+            buddy_free(where_start);
+
+            if (s->free_offs != NULL) {                      // free the array
+                free(s->free_offs);
+                s->free_offs = NULL;
+            }
+
+            s->alive = 0;                                  // reset back all slab
+            s->slab_off = 0;
+            s->real_objects_size = 0;
+            s->capacity = 0;
+            s->free_top = 0;
+        }
+    }
+}
+
+
+void slab_cleanup(void) {
+    for (int i = 0; i < slab_count; i++) {           //kinda similar to slab_free
+        simple_slab_t *s = &slabs[i];
+        if (!s->alive)                             //skip empty slab
+            continue;
+
+        uint8_t *slab_ptr = (uint8_t *)offset_to_pointer(s->slab_off);
+        uint8_t *usable_ptr = slab_ptr + global_header_size;
+
+        buddy_free(usable_ptr);                  //using buddy free to return the slab memory
+
+        if (s->free_offs) {                      //free and null the offset
+            free(s->free_offs);
+            s->free_offs = NULL;
+        }
+
+        s->alive = 0;                          //reset
+        s->slab_off = 0;
+        s->real_objects_size = 0;
+        s->capacity = 0;
+        s->used = 0;
+        s->free_top = 0;
+    }
+
+    slab_count = 0;
+}
+
+
+
 
 
 
