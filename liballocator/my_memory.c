@@ -228,165 +228,92 @@ void buddy_cleanup(void) {
 }
 
 
-// ======================= Slab Allocation =======================
 
-typedef struct sdt_row {
-    size_t type_bytes;        
-    size_t slab_size_bytes;   
-    int    total_objects;     
-    int    used_objects;      
-    void*  slab_ptr;          
-    struct sdt_row* next;
-} sdt_row_t;
+// START SLABBB
 
-typedef struct slab {
-    struct slab* next;        // slabs for this class
-    void*  slab_start;        // buddy base 
-    size_t slab_size;         // actual buddy block size (power-of-two)   
-    size_t actual_obj_size;
-    size_t capacity;          // # objects
-    size_t used;              // # in use
-    sdt_row_t* sdt;           // SDT 
-} slab_t;
- 
-typedef struct slab_class {               //class represents a a specific slab and its type size,
-    size_t actual_obj_size;               // eg. class[1] = store type_size 600bytes
-    free_node_t* free_objs;               // eg. class[2] = store type_size 1000bytes
-    slab_t* slabs;            
-} slab_class_t;
 
-#define MAX_CLASSES 50000
-static slab_class_t global_classes[MAX_CLASSES];
-static int global_type_count = 0;
+#ifndef MAX_SLABS
+#define MAX_SLABS 4096
+#endif
 
-static void class_insert_sorted(free_node_t** head, size_t off) {
-    free_node_t* node = (free_node_t*)malloc(sizeof(free_node_t));
-    node->offset = off;
-    if (*head == NULL || (*head)->offset > off) {
-        node->next = *head; *head = node; return;
-    }
-    free_node_t* cur = *head;
-    while (cur->next && cur->next->offset < off) cur = cur->next;
-    node->next = cur->next; cur->next = node;
-}
-static bool class_pop_lowest(free_node_t** head, size_t* out_off) {
-    if (*head == NULL) return false;
-    free_node_t* n = *head; *out_off = n->offset; *head = n->next; free(n); return true;
-}
-static bool class_remove(free_node_t** head, size_t off) {
-    free_node_t* cur = *head; free_node_t* prev = NULL;
-    while (cur) {
-        if (cur->offset == off) {
-            if (prev) prev->next = cur->next; else *head = cur->next;
-            free(cur); return true;
+typedef struct {
+    int    alive;           // 1 if alive, 0 if free
+    size_t slab_off;        // where slab starts
+    size_t real_objects_size;        // size of each obj in slab
+    int    capacity;        // should be = global_object_per_slab
+    int    used;            // no of objs in slab
+    int    free_top;        // index for next free spot
+    size_t *free_offs;      // array holding the offsets
+} simple_slab_t;
+
+static simple_slab_t slabs[MAX_SLABS];
+static int slab_count = 0;
+
+static int make_slab(size_t real_objects_size) {
+    int slab_id = -1;
+    for (int i = 0; i < slab_count; ++i) {           //find inactive slab to use
+         if (!slabs[i].alive) {
+            slab_id = i; break;
         }
-        prev = cur; cur = cur->next;
+     }
+
+    if (slab_id < 0) {
+        if (slab_count >= MAX_SLABS)             //check if can make new one (slab_count< max_slabs)
+            return -1;
+        slab_id = slab_count++;
     }
-    return false;
-}
 
+    int cap = global_object_per_slab;
+    size_t bytes_slab_use = (size_t)cap * real_objects_size;
 
-static int find_class(size_t actual_obj_size) {
-    for (int i = 0; i < global_type_count; ++i) {
-        if (global_classes[i].actual_obj_size == actual_obj_size) return i;         // returning the class
-    }
-    global_classes[global_type_count] = (slab_class_t){          // create a new class if the slab for that type does not exist yet
-        .actual_obj_size = actual_obj_size,                                   
-        .free_objs = NULL,
-        .slabs = NULL
-    };
+    void* slab_from_buddy = buddy_malloc(bytes_slab_use);            //use buddy allocator to give slab large enough for the memory
+    if (!slab_from_buddy)
+        return -1;
 
-    return global_type_count++;
-}
+    uint8_t* slab_start = (uint8_t*)slab_from_buddy - global_header_size;      //find the real slab start
 
-static slab_t* slab_new(size_t type_bytes){
-    size_t actual_obj_size   = global_header_size + type_bytes;               
-    size_t size_of_slab  = (size_t)global_object_per_slab * actual_obj_size;
-
-    void* slab_from_buddy = buddy_malloc(size_of_slab);  // ask buddy for slab
-    if (!slab_from_buddy) return NULL;
-
-
-    void* slab_start = (uint8_t*)slab_from_buddy - global_header_size;     // buddy header is here
-
-    header_t* bh = (header_t*)slab_start;
-    size_t real_slab_size = ((size_t)global_min_chunk_size) << bh->order;
-
-
-    size_t cap = (size_t)global_object_per_slab;                      // create the slab
-    slab_t* s = (slab_t*)malloc(sizeof(*s));
-    *s = (slab_t){ .next=NULL, .slab_start=slab_start, .slab_size=real_slab_size,
-                   .actual_obj_size=actual_obj_size, .capacity=cap, .used=0, .sdt=NULL };
-
-    // create class for that type_size 
-    int class_id = find_class(actual_obj_size);
-  
-    s->next = global_classes[class_id].slabs;
-    global_classes[class_id].slabs = s;
-
+    simple_slab_t *S = &slabs[slab_id];                  //creating a slab S and fill in the characteristic of that slab
+    *S = (simple_slab_t){0};                             //reset all field to zero first lol
+    S->alive    = 1;
+    S->slab_off = pointer_to_offset(slab_start);
+    S->real_objects_size = real_objects_size;
+    S->capacity = cap;
+    S->used     = 0;
+    S->free_top = 0;
+    S->free_offs = (size_t*)malloc((size_t)cap * sizeof(size_t));          //create array to track of free object locations
+ 
     
-    uint8_t* base = (uint8_t*)slab_start + global_header_size;
-    for (size_t i = 0; i < cap; ++i){
-        size_t off = pointer_to_offset(base + i * actual_obj_size);
-        class_insert_sorted(&global_classes[class_id].free_objs, off);
+    if (!S->free_offs) {
+        buddy_free(slab_from_buddy);          //clean up if fail the array alloaction 
+        S->alive = 0;
+        return -1;
     }
 
-    //update SDT
-    s->sdt = (sdt_row_t*)malloc(sizeof(sdt_row_t));
-    *(s->sdt) = (sdt_row_t){ .type_bytes=type_bytes, .slab_size_bytes=real_slab_size,
-                             .total_objects=(int)cap, .used_objects=0,
-                             .slab_ptr=slab_start, .next=NULL };
-    return s;
-}
-
-void slab_init(void){
-    global_type_count = 0;
-    for (int i = 0; i < MAX_CLASSES; ++i)
-     global_classes[i] = (slab_class_t){0};
-}
-
-
-
-void* slab_malloc(int user_size){
-    if (user_size <= 0) return NULL;
-    size_t actual_obj_size = global_header_size + (size_t)user_size;        
-    int class_id = find_class(actual_obj_size);
-    if (class_id < 0) return NULL;
-
-    size_t obj_off = 0;
-    if (!class_pop_lowest(&global_classes[class_id].free_objs, &obj_off)) {
-
-        slab_t* made = slab_new((size_t)user_size);     //makes new slab if there is no slab
-        if (!made) return NULL;
-
-       
-        if (!class_pop_lowest(&global_classes[class_id].free_objs, &obj_off)) return NULL;
+    uint8_t* base = slab_start + global_header_size;         //fill the free list will all objs slots
+    for (int i = cap - 1; i >= 0; --i) {
+        S->free_offs[S->free_top++] = pointer_to_offset(base + (size_t)i * real_objects_size);
     }
+    return slab_id;               
+}
 
-    void* obj_block = offset_to_pointer(obj_off);
-
-    header_t* oh = (header_t*)obj_block;
-    oh->tag = TAG_BUDY;
-    oh->order = 0;
-
-    slab_t* s = global_classes[class_id].slabs;
-    while (s != NULL) {
-        uint8_t* slab_begin = (uint8_t*)s->slab_start + global_header_size;
-        uint8_t* slab_end   = slab_begin + (s->capacity * s->actual_obj_size);
-
-        if ((uint8_t*)obj_block >= slab_begin && (uint8_t*)obj_block < slab_end) {
-            s->used++;
-
-            if (s->sdt != NULL)
-                s->sdt->used_objects++;
-            break;
+void slab_init(void) {
+    for (int i = 0; i < MAX_SLABS; ++i) {            //helps initialize the slabs for other functions
+        slabs[i].alive = 0;
+        slabs[i].slab_off = 0;
+        slabs[i].real_objects_size = 0;
+        slabs[i].capacity = 0;
+        slabs[i].used = 0;
+        slabs[i].free_top = 0;
+        slabs[i].free_offs = NULL;
     }
-
-    s = s->next;
+    slab_count = 0;
 }
 
-    return (uint8_t*)obj_block + global_header_size;                  // user pointer
-}
+
+
+
+
+
 
 
 
